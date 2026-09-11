@@ -1,12 +1,20 @@
-// Every call to Claude lives in this one file. Route handlers call these
-// functions; they never talk to the Anthropic SDK directly. That keeps the
-// API key server-side and keeps prompt logic in one place instead of scattered
-// across route files (brief section 06: "never call the AI provider from the browser").
-import Anthropic from "@anthropic-ai/sdk";
+// Every call to an AI provider lives in this one file. Route handlers call
+// these functions; they never talk to the AI SDK directly. That keeps the
+// API key server-side and keeps prompt logic in one place (brief section 06).
+//
+// PROVIDER NOTE: this project was originally built against the Anthropic
+// Claude API, per the brief's stated tech stack (Section 05). It was swapped
+// to Google's Gemini API (free tier via Google AI Studio) after Anthropic
+// API credits were exhausted during testing/demo. Because every AI call was
+// already isolated to this single file, the swap required no changes
+// anywhere else in the app — every route handler still calls the same
+// exported function names (classifyFeedback, answerFromFeedback,
+// generateVoCNarrative) with the same inputs/outputs.
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { z } from "zod";
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const MODEL = "claude-sonnet-4-6";
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY ?? "");
+const MODEL = "gemini-3.6-flash"; // fast, available on Gemini's free tier
 
 // ---------- AI1: Structured classification ----------
 
@@ -47,14 +55,14 @@ Return ONLY a JSON object, no markdown fences, no commentary, with exactly this 
   "rationale": one short sentence explaining the classification
 }`;
 
-  const raw = await callClaudeForJson(prompt);
+  const raw = await callGeminiForJson(prompt);
   const parsed = ClassificationSchema.safeParse(raw);
 
   if (!parsed.success) {
     // Retry once with a stricter reminder before giving up (brief 9.1: "retry once,
     // then flag for manual review" — here we throw, and the route handler decides
     // how to flag it).
-    const retryRaw = await callClaudeForJson(
+    const retryRaw = await callGeminiForJson(
       prompt + "\n\nReminder: return ONLY valid JSON matching the exact shape above."
     );
     const retryParsed = ClassificationSchema.safeParse(retryRaw);
@@ -88,13 +96,9 @@ Question: ${question}
 
 Write a concise, direct answer (3-6 sentences). Refer to excerpts by their [number] when citing them.`;
 
-  const response = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 600,
-    messages: [{ role: "user", content: prompt }],
-  });
-
-  return extractText(response);
+  const model = genAI.getGenerativeModel({ model: MODEL });
+  const result = await model.generateContent(prompt);
+  return result.response.text();
 }
 
 // ---------- AI4: Voice-of-Customer report ----------
@@ -106,9 +110,10 @@ export async function generateVoCNarrative(stats: {
   topThemes: { name: string; count: number; deltaVsPrevious: number }[];
   sampleQuotes: string[];
 }): Promise<{ summary: string; recommendedActions: string[] }> {
-  // We pre-compute every number in code (see lib/reportStats.ts) and only ask
-  // Claude to write the narrative AROUND those numbers. This is the pattern the
-  // brief specifies in section 9.3 — it stops the model from inventing figures.
+  // We pre-compute every number in code (see app/api/reports/route.ts) and only
+  // ask the model to write the narrative AROUND those numbers. This is the
+  // pattern the brief specifies in section 9.3 — it stops the model from
+  // inventing figures.
   const prompt = `You are writing the narrative section of a Voice-of-Customer report for
 the period "${stats.periodLabel}". Use ONLY the numbers and quotes given below — do not
 invent statistics.
@@ -127,7 +132,7 @@ Return ONLY JSON, no markdown fences:
   "recommendedActions": ["3 to 5 short, concrete recommended actions"]
 }`;
 
-  const raw = await callClaudeForJson(prompt);
+  const raw = await callGeminiForJson(prompt);
   const schema = z.object({
     summary: z.string(),
     recommendedActions: z.array(z.string()),
@@ -137,13 +142,10 @@ Return ONLY JSON, no markdown fences:
 
 // ---------- shared helpers ----------
 
-async function callClaudeForJson(prompt: string): Promise<unknown> {
-  const response = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 800,
-    messages: [{ role: "user", content: prompt }],
-  });
-  const text = extractText(response).trim();
+async function callGeminiForJson(prompt: string): Promise<unknown> {
+  const model = genAI.getGenerativeModel({ model: MODEL });
+  const result = await model.generateContent(prompt);
+  const text = result.response.text().trim();
   // Strip stray markdown fences in case the model wraps JSON in ```json ... ```
   const cleaned = text.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "");
   try {
@@ -151,11 +153,4 @@ async function callClaudeForJson(prompt: string): Promise<unknown> {
   } catch {
     throw new Error("Model did not return valid JSON: " + text.slice(0, 200));
   }
-}
-
-function extractText(response: Anthropic.Messages.Message): string {
-  return response.content
-    .filter((block): block is Anthropic.TextBlock => block.type === "text")
-    .map((block) => block.text)
-    .join("\n");
 }
